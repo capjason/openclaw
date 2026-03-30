@@ -509,11 +509,26 @@ function ensureListener() {
       const endedAt = typeof evt.data?.endedAt === "number" ? evt.data.endedAt : Date.now();
       const error = typeof evt.data?.error === "string" ? evt.data.error : undefined;
       if (phase === "error") {
-        schedulePendingLifecycleError({
-          runId: evt.runId,
-          endedAt,
-          error,
-        });
+        // Abort errors are terminal — skip grace period and complete immediately
+        // to unblock the parent session. Other errors may be transient retries.
+        const isAbort = evt.data?.aborted === true || error === "aborted";
+        if (isAbort) {
+          await completeSubagentRun({
+            runId: evt.runId,
+            endedAt,
+            outcome: { status: "error", error: error ?? "aborted" },
+            reason: SUBAGENT_ENDED_REASON_ERROR,
+            sendFarewell: true,
+            accountId: entry.requesterOrigin?.accountId,
+            triggerCleanup: true,
+          });
+        } else {
+          schedulePendingLifecycleError({
+            runId: evt.runId,
+            endedAt,
+            error,
+          });
+        }
         return;
       }
       clearPendingLifecycleError(evt.runId);
