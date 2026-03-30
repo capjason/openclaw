@@ -386,7 +386,12 @@ export async function runSubagentAnnounceFlow(params: {
         0,
         subagentRegistryRuntime.countPendingDescendantRuns(params.childSessionKey),
       );
-      if (pendingChildDescendantRuns > 0 && announceType !== "cron job") {
+      if (
+        pendingChildDescendantRuns > 0 &&
+        announceType !== "cron job" &&
+        outcome?.status !== "error" &&
+        outcome?.status !== "timeout"
+      ) {
         shouldDeleteChildSession = false;
         return false;
       }
