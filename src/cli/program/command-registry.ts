@@ -202,6 +202,11 @@ const coreEntries: CoreCliEntry[] = [
         description: "Inspect durable background task state",
         hasSubcommands: true,
       },
+      {
+        name: "subagents",
+        description: "List active and recent subagent runs with task details",
+        hasSubcommands: false,
+      },
     ],
     register: async ({ program }) => {
       const mod = await import("./register.status-health-sessions.js");

@@ -4,6 +4,7 @@ import { healthCommand } from "../../commands/health.js";
 import { sessionsCleanupCommand } from "../../commands/sessions-cleanup.js";
 import { sessionsCommand } from "../../commands/sessions.js";
 import { statusCommand } from "../../commands/status.js";
+import { subagentsListCommand } from "../../commands/subagents.js";
 import {
   tasksAuditCommand,
   tasksCancelCommand,
@@ -449,6 +450,27 @@ export function registerStatusHealthSessionsCommands(program: Command) {
         await flowsCancelCommand(
           {
             lookup,
+          },
+          defaultRuntime,
+        );
+      });
+    });
+
+  program
+    .command("subagents")
+    .description("List active and recent subagent runs with task details")
+    .option("--json", "Output as JSON", false)
+    .option("--all", "Include descendant subagents (not just direct children)", false)
+    .option("--session <key>", "Filter by requester session key")
+    .option("--limit <n>", "Max older runs to show (default 5)")
+    .action(async (opts) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        await subagentsListCommand(
+          {
+            json: Boolean(opts.json),
+            all: Boolean(opts.all),
+            session: opts.session as string | undefined,
+            limit: parsePositiveIntOrUndefined(opts.limit),
           },
           defaultRuntime,
         );

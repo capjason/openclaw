@@ -1,6 +1,20 @@
-import { buildSubagentList } from "../../../agents/subagent-control.js";
+import { buildSubagentList, type SubagentListItem } from "../../../agents/subagent-control.js";
+import { truncateLine } from "../../../shared/subagents-format.js";
+import { findLatestTaskForSessionKey } from "../../../tasks/task-registry.js";
 import type { CommandHandlerResult } from "../commands-types.js";
 import { type SubagentsCommandContext, RECENT_WINDOW_MINUTES, stopWithText } from "./shared.js";
+
+function formatEntryWithDetails(entry: SubagentListItem): string {
+  const parts = [entry.line];
+  const task = findLatestTaskForSessionKey(entry.sessionKey);
+  if (task?.progressSummary?.trim()) {
+    parts.push(`   Progress: ${truncateLine(task.progressSummary.trim(), 120)}`);
+  }
+  if (task?.error?.trim()) {
+    parts.push(`   Error: ${truncateLine(task.error.trim(), 120)}`);
+  }
+  return parts.join("\n");
+}
 
 export function handleSubagentsListAction(ctx: SubagentsCommandContext): CommandHandlerResult {
   const { params, runs } = ctx;
@@ -14,13 +28,13 @@ export function handleSubagentsListAction(ctx: SubagentsCommandContext): Command
   if (list.active.length === 0) {
     lines.push("(none)");
   } else {
-    lines.push(list.active.map((entry) => entry.line).join("\n"));
+    lines.push(list.active.map(formatEntryWithDetails).join("\n"));
   }
   lines.push("", `recent subagents (last ${RECENT_WINDOW_MINUTES}m):`, "-----");
   if (list.recent.length === 0) {
     lines.push("(none)");
   } else {
-    lines.push(list.recent.map((entry) => entry.line).join("\n"));
+    lines.push(list.recent.map(formatEntryWithDetails).join("\n"));
   }
 
   return stopWithText(lines.join("\n"));
