@@ -1,0 +1,14 @@
+{
+  "name": "@openclaw/context-recall",
+  "version": "2026.3.30",
+  "description": "Automatically preserves conversation context before compaction and recalls relevant chunks on demand",
+  "type": "module",
+  "dependencies": {
+    "openai": "^6.33.0"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

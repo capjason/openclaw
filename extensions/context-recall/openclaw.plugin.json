@@ -1,0 +1,66 @@
+{
+  "id": "context-recall",
+  "name": "Context Recall",
+  "description": "Preserves conversation context in a vector store before compaction and injects relevant past context into new prompts",
+  "uiHints": {
+    "embedding.provider": {
+      "label": "Embedding Provider",
+      "placeholder": "openai",
+      "help": "Provider for embeddings (auto-detected from configured LLM providers if omitted)"
+    },
+    "embedding.apiKey": {
+      "label": "API Key Override",
+      "sensitive": true,
+      "placeholder": "sk-proj-...",
+      "help": "Override API key (auto-detected from configured providers if omitted)",
+      "advanced": true
+    },
+    "embedding.model": {
+      "label": "Embedding Model",
+      "placeholder": "text-embedding-3-small",
+      "help": "Embedding model to use"
+    },
+    "embedding.baseUrl": {
+      "label": "Base URL",
+      "placeholder": "https://api.openai.com/v1",
+      "help": "Base URL for compatible embedding providers",
+      "advanced": true
+    },
+    "embedding.dimensions": {
+      "label": "Dimensions",
+      "placeholder": "1536",
+      "help": "Vector dimensions (required for non-standard models)",
+      "advanced": true
+    },
+    "topK": {
+      "label": "Top K Results",
+      "placeholder": "5",
+      "help": "Number of past context chunks to recall per prompt"
+    },
+    "minScore": {
+      "label": "Min Similarity Score",
+      "placeholder": "0.3",
+      "help": "Minimum cosine similarity score to include a chunk (0-1)"
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "embedding": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "provider": { "type": "string" },
+          "apiKey": { "type": "string" },
+          "model": { "type": "string" },
+          "baseUrl": { "type": "string" },
+          "dimensions": { "type": "number" }
+        }
+      },
+      "topK": { "type": "number", "minimum": 1, "maximum": 20 },
+      "minScore": { "type": "number", "minimum": 0, "maximum": 1 },
+      "maxChunkTokens": { "type": "number", "minimum": 200, "maximum": 8000 }
+    }
+  }
+}
