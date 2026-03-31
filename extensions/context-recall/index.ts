@@ -2,20 +2,21 @@
  * OpenClaw Context Recall Plugin
  *
  * Automatically preserves conversation context before compaction by chunking
- * and embedding conversation turns into a local vector store. On each new
+ * and embedding conversation turns into a LanceDB vector store. On each new
  * prompt, retrieves the most relevant past context chunks and injects them
  * so the agent retains access to important details that were compacted away.
  */
 
 import { randomUUID } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
-import fs from "node:fs/promises";
 import path from "node:path";
 import { createInterface } from "node:readline";
+import type * as LanceDB from "@lancedb/lancedb";
 import OpenAI from "openai";
 import { resolveApiKeyForProvider } from "openclaw/plugin-sdk/provider-auth-runtime";
 import { ensureGlobalUndiciEnvProxyDispatcher } from "openclaw/plugin-sdk/runtime-env";
 import { definePluginEntry, type OpenClawPluginApi } from "./api.js";
+import { loadLanceDbModule } from "./lancedb-runtime.js";
 
 // ============================================================================
 // Types
@@ -32,8 +33,8 @@ type ContextChunk = {
 
 type PluginConfig = {
   embedding?: {
-    provider?: string; // "openai" (default), "google", etc.
-    apiKey?: string; // explicit override; auto-detected from openclaw auth if omitted
+    provider?: string;
+    apiKey?: string;
     model?: string;
     baseUrl?: string;
     dimensions?: number;
@@ -59,7 +60,7 @@ const DEFAULT_MODEL = "text-embedding-3-small";
 const DEFAULT_TOP_K = 5;
 const DEFAULT_MIN_SCORE = 0.25;
 const DEFAULT_MAX_CHUNK_TOKENS = 2000;
-const STORE_FILENAME = "chunks.jsonl";
+const TABLE_NAME = "context_chunks";
 const MAX_TEXT_PER_CHUNK = 8000; // chars, roughly 2000 tokens
 
 // ============================================================================
@@ -101,44 +102,64 @@ class Embeddings {
     });
     return response.data.toSorted((a, b) => a.index - b.index).map((d) => d.embedding);
   }
+
+  getDimensions(): number {
+    return this.dimensions ?? 1536;
+  }
 }
 
 // ============================================================================
-// Chunk Store (JSONL + cosine similarity)
+// LanceDB Chunk Store
 // ============================================================================
 
-class ChunkStore {
-  private chunks: ContextChunk[] = [];
-  private loaded = false;
+class ChunkDB {
+  private db: LanceDB.Connection | null = null;
+  private table: LanceDB.Table | null = null;
+  private initPromise: Promise<void> | null = null;
 
-  constructor(private readonly storePath: string) {}
+  constructor(
+    private readonly dbPath: string,
+    private readonly vectorDim: number,
+    private readonly logger: { info: (msg: string) => void; warn: (msg: string) => void },
+  ) {}
 
-  private async ensureLoaded(): Promise<void> {
-    if (this.loaded) return;
-    this.loaded = true;
-    if (!existsSync(this.storePath)) return;
+  private async ensureInitialized(): Promise<void> {
+    if (this.table) return;
+    if (this.initPromise) return this.initPromise;
+    this.initPromise = this.doInitialize();
+    return this.initPromise;
+  }
 
-    const rl = createInterface({
-      input: createReadStream(this.storePath, { encoding: "utf-8" }),
-      crlfDelay: Infinity,
+  private async doInitialize(): Promise<void> {
+    const lancedb = await loadLanceDbModule({
+      info: (msg) => this.logger.info(msg),
+      warn: (msg) => this.logger.warn(msg),
     });
-    for await (const line of rl) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try {
-        this.chunks.push(JSON.parse(trimmed) as ContextChunk);
-      } catch {
-        // skip malformed lines
-      }
+    this.db = await lancedb.connect(this.dbPath);
+    const tables = await this.db.tableNames();
+
+    if (tables.includes(TABLE_NAME)) {
+      this.table = await this.db.openTable(TABLE_NAME);
+    } else {
+      // Create table with schema row then delete it
+      this.table = await this.db.createTable(TABLE_NAME, [
+        {
+          id: "__schema__",
+          sessionKey: "",
+          text: "",
+          vector: Array.from({ length: this.vectorDim }).fill(0),
+          turnIndex: 0,
+          createdAt: 0,
+        },
+      ]);
+      await this.table.delete('id = "__schema__"');
     }
   }
 
   async addChunks(chunks: ContextChunk[]): Promise<void> {
-    await this.ensureLoaded();
-    await fs.mkdir(path.dirname(this.storePath), { recursive: true });
-    const lines = chunks.map((c) => JSON.stringify(c)).join("\n") + "\n";
-    await fs.appendFile(this.storePath, lines, "utf-8");
-    this.chunks.push(...chunks);
+    await this.ensureInitialized();
+    if (chunks.length === 0) return;
+    await this.table!.add(chunks);
   }
 
   async search(
@@ -146,43 +167,41 @@ class ChunkStore {
     topK: number,
     minScore: number,
   ): Promise<Array<{ chunk: ContextChunk; score: number }>> {
-    await this.ensureLoaded();
-    if (this.chunks.length === 0) return [];
+    await this.ensureInitialized();
+    const count = await this.table!.countRows();
+    if (count === 0) return [];
 
-    const scored = this.chunks.map((chunk) => ({
-      chunk,
-      score: cosineSimilarity(queryVector, chunk.vector),
-    }));
-    return scored
-      .filter((r) => r.score >= minScore)
-      .toSorted((a, b) => b.score - a.score)
-      .slice(0, topK);
+    const results = await this.table!.vectorSearch(queryVector).limit(topK).toArray();
+
+    return results
+      .map((row) => {
+        const distance = (row._distance as number) ?? 0;
+        // L2 distance → similarity: sim = 1 / (1 + d)
+        const score = 1 / (1 + distance);
+        return {
+          chunk: {
+            id: row.id as string,
+            sessionKey: row.sessionKey as string,
+            text: row.text as string,
+            vector: row.vector as number[],
+            turnIndex: row.turnIndex as number,
+            createdAt: row.createdAt as number,
+          },
+          score,
+        };
+      })
+      .filter((r) => r.score >= minScore);
   }
 
   async hasChunks(): Promise<boolean> {
-    await this.ensureLoaded();
-    return this.chunks.length > 0;
+    await this.ensureInitialized();
+    return (await this.table!.countRows()) > 0;
   }
 
-  /** Check if we already have chunks from this session to avoid re-indexing. */
-  async hasChunksForSession(sessionKey: string): Promise<boolean> {
-    await this.ensureLoaded();
-    return this.chunks.some((c) => c.sessionKey === sessionKey);
+  async count(): Promise<number> {
+    await this.ensureInitialized();
+    return this.table!.countRows();
   }
-}
-
-function cosineSimilarity(a: number[], b: number[]): number {
-  if (a.length !== b.length) return 0;
-  let dotProduct = 0;
-  let normA = 0;
-  let normB = 0;
-  for (let i = 0; i < a.length; i++) {
-    dotProduct += a[i] * b[i];
-    normA += a[i] * a[i];
-    normB += b[i] * b[i];
-  }
-  const denom = Math.sqrt(normA) * Math.sqrt(normB);
-  return denom === 0 ? 0 : dotProduct / denom;
 }
 
 // ============================================================================
@@ -235,7 +254,7 @@ async function readSessionMessages(
 }
 
 /**
- * Group messages into conversation turn chunks (user→assistant pairs).
+ * Group messages into conversation turn chunks (user->assistant pairs).
  * Each chunk captures a coherent exchange. Large chunks are split.
  */
 function chunkConversation(
@@ -247,22 +266,18 @@ function chunkConversation(
   let lastRole = "";
 
   for (const msg of messages) {
-    // Skip tool results and system messages - they're verbose and low-signal
     if (msg.role !== "user" && msg.role !== "assistant") continue;
 
     const entry = `[${msg.role}]: ${msg.text}`;
 
-    // Start new chunk on user message after an assistant message
     if (msg.role === "user" && lastRole === "assistant" && currentChunk) {
       chunks.push(currentChunk.trim());
       currentChunk = "";
     }
 
-    // If single entry exceeds limit, truncate it
     const truncatedEntry =
       entry.length > maxCharsPerChunk ? entry.slice(0, maxCharsPerChunk) + "..." : entry;
 
-    // If adding would exceed limit, flush current chunk first
     if (currentChunk && currentChunk.length + truncatedEntry.length + 1 > maxCharsPerChunk) {
       chunks.push(currentChunk.trim());
       currentChunk = "";
@@ -276,7 +291,7 @@ function chunkConversation(
     chunks.push(currentChunk.trim());
   }
 
-  return chunks.filter((c) => c.length > 20); // skip tiny fragments
+  return chunks.filter((c) => c.length > 20);
 }
 
 // ============================================================================
@@ -315,10 +330,6 @@ function formatRecalledContext(results: Array<{ chunk: ContextChunk; score: numb
 }
 
 // ============================================================================
-// Plugin Definition
-// ============================================================================
-
-// ============================================================================
 // Auto-detect embedding API key from openclaw's configured providers
 // ============================================================================
 
@@ -328,7 +339,6 @@ async function resolveEmbeddingApiKey(
   cfg: PluginConfig | undefined,
   openclawConfig: unknown,
 ): Promise<{ apiKey: string; provider: string } | null> {
-  // 1. Explicit config override
   if (cfg?.embedding?.apiKey) {
     return {
       apiKey: cfg.embedding.apiKey,
@@ -336,12 +346,10 @@ async function resolveEmbeddingApiKey(
     };
   }
 
-  // 2. Environment variable
   if (process.env.OPENAI_API_KEY) {
     return { apiKey: process.env.OPENAI_API_KEY, provider: "openai" };
   }
 
-  // 3. Auto-detect from openclaw auth profiles
   const targetProvider = cfg?.embedding?.provider;
   const providers = targetProvider ? [targetProvider] : EMBEDDING_PROVIDER_PRIORITY;
 
@@ -376,12 +384,11 @@ export default definePluginEntry({
     const cfg = (api.pluginConfig ?? {}) as PluginConfig;
     const topK = cfg.topK ?? DEFAULT_TOP_K;
     const minScore = cfg.minScore ?? DEFAULT_MIN_SCORE;
-    const maxChunkChars = (cfg.maxChunkTokens ?? DEFAULT_MAX_CHUNK_TOKENS) * 4; // rough chars
+    const maxChunkChars = (cfg.maxChunkTokens ?? DEFAULT_MAX_CHUNK_TOKENS) * 4;
 
-    const storePath = api.resolvePath(path.join("context-recall", STORE_FILENAME));
-    const store = new ChunkStore(storePath);
+    const dbPath = api.resolvePath("context-recall-db");
 
-    // Lazy-init embeddings: resolve API key on first use
+    // Lazy-init embeddings
     let embeddingsInstance: Embeddings | null = null;
     let embeddingsResolveFailed = false;
 
@@ -411,7 +418,17 @@ export default definePluginEntry({
       return embeddingsInstance;
     }
 
-    api.logger.info(`context-recall: registered (topK: ${topK}, store: ${storePath})`);
+    // Lazy-init LanceDB store (needs vector dimensions from embeddings)
+    let storeInstance: ChunkDB | null = null;
+
+    function getStore(vectorDim: number): ChunkDB {
+      if (!storeInstance) {
+        storeInstance = new ChunkDB(dbPath, vectorDim, api.logger);
+      }
+      return storeInstance;
+    }
+
+    api.logger.info(`context-recall: registered (topK: ${topK}, store: ${dbPath})`);
 
     // ========================================================================
     // Capture: before_compaction hook
@@ -425,6 +442,7 @@ export default definePluginEntry({
       if (!embedder) return;
 
       const sessionKey = ctx.sessionKey ?? "unknown";
+      const store = getStore(embedder.getDimensions());
 
       try {
         api.logger.info(
@@ -453,7 +471,10 @@ export default definePluginEntry({
 
         await store.addChunks(chunks);
 
-        api.logger.info(`context-recall: stored ${chunks.length} chunks for session ${sessionKey}`);
+        const total = await store.count();
+        api.logger.info(
+          `context-recall: stored ${chunks.length} chunks for session ${sessionKey} (total: ${total})`,
+        );
       } catch (err) {
         api.logger.warn(
           `context-recall: capture failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -470,16 +491,16 @@ export default definePluginEntry({
       if (!prompt || prompt.length < 5) return;
 
       try {
-        // Skip if no chunks have been stored yet
+        const embedder = await getEmbeddings();
+        if (!embedder) return;
+
+        const store = getStore(embedder.getDimensions());
+
         const hasAny = await store.hasChunks();
         if (!hasAny) return;
 
-        // Embed the current query
-        const embedder = await getEmbeddings();
-        if (!embedder) return;
         const queryVector = await embedder.embed(prompt);
 
-        // Search for relevant past context
         const results = await store.search(queryVector, topK, minScore);
         if (results.length === 0) return;
 
@@ -504,7 +525,7 @@ export default definePluginEntry({
     api.registerService({
       id: "context-recall",
       start: () => {
-        api.logger.info(`context-recall: service started (store: ${storePath})`);
+        api.logger.info(`context-recall: service started (store: ${dbPath})`);
       },
     });
   },

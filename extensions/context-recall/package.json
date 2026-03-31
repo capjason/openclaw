@@ -4,6 +4,7 @@
   "description": "Automatically preserves conversation context before compaction and recalls relevant chunks on demand",
   "type": "module",
   "dependencies": {
+    "@lancedb/lancedb": "^0.27.1",
     "openai": "^6.33.0"
   },
   "openclaw": {

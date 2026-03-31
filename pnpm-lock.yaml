@@ -281,6 +281,9 @@ importers:
 
   extensions/context-recall:
     dependencies:
+      '@lancedb/lancedb':
+        specifier: ^0.27.1
+        version: 0.27.1(apache-arrow@18.1.0)
       openai:
         specifier: ^6.33.0
         version: 6.33.0(ws@8.20.0)(zod@4.3.6)
